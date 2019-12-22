@@ -7,13 +7,20 @@
 //
 
 import Foundation
+#if os(iOS)
+#if !OAUTH_APP_EXTENSIONS
+import UIKit
+#endif
+#endif
 
 let kHTTPHeaderContentType = "Content-Type"
 
 open class OAuthSwiftHTTPRequest: NSObject, OAuthSwiftRequestHandle {
 
-    public typealias SuccessHandler = (_ response: OAuthSwiftResponse) -> Void
-    public typealias FailureHandler = (_ error: OAuthSwiftError) -> Void
+    // Using NSLock for Linux compatible locking 
+    let requestLock = NSLock()
+
+    public typealias CompletionHandler = (_ result: Result<OAuthSwiftResponse, OAuthSwiftError>) -> Void
 
     /// HTTP request method
     /// https://en.wikipedia.org/wiki/Hypertext_Transfer_Protocol#Request_methods
@@ -57,25 +64,23 @@ open class OAuthSwiftHTTPRequest: NSObject, OAuthSwiftRequestHandle {
     }
 
     /// START request
-    func start(success: SuccessHandler?, failure: FailureHandler?) {
+    func start(completionHandler completion: CompletionHandler?) {
         guard request == nil else { return } // Don't start the same request twice!
-
-        let successHandler = success
-        let failureHandler = failure
 
         do {
             self.request = try self.makeRequest()
         } catch let error as NSError {
-            failureHandler?(OAuthSwiftError.requestCreation(message: error.localizedDescription))
+            completion?(.failure(.requestCreation(message: error.localizedDescription)))
             self.request = nil
             return
         }
 
         OAuthSwiftHTTPRequest.executionContext {
             // perform lock here to prevent cancel calls on another thread while creating the request
-            objc_sync_enter(self)
-            defer { objc_sync_exit(self) }
+            self.requestLock.lock()
+            defer { self.requestLock.unlock() }
             if self.cancelRequested {
+                completion?(.failure(.cancelled))
                 return
             }
 
@@ -84,8 +89,7 @@ open class OAuthSwiftHTTPRequest: NSObject, OAuthSwiftRequestHandle {
 
             if self.config.sessionFactory.useDataTaskClosure {
                 let completionHandler: (Data?, URLResponse?, Error?) -> Void = { data, resp, error in
-                    OAuthSwiftHTTPRequest.completionHandler(successHandler: success,
-                                                            failureHandler: failure,
+                    OAuthSwiftHTTPRequest.completionHandler(completionHandler: completion,
                                                             request: usedRequest,
                                                             data: data,
                                                             resp: resp,
@@ -101,17 +105,21 @@ open class OAuthSwiftHTTPRequest: NSObject, OAuthSwiftRequestHandle {
 
             #if os(iOS)
                 #if !OAUTH_APP_EXTENSIONS
+                #if !targetEnvironment(macCatalyst)
                     UIApplication.shared.isNetworkActivityIndicatorVisible = self.config.sessionFactory.isNetworkActivityIndicatorVisible
+                    #endif
                 #endif
             #endif
         }
     }
 
     /// Function called when receiving data from server.
-    public static func completionHandler(successHandler: SuccessHandler?, failureHandler: FailureHandler?, request: URLRequest, data: Data?, resp: URLResponse?, error: Error?) {
+    public static func completionHandler(completionHandler completion: CompletionHandler?, request: URLRequest, data: Data?, resp: URLResponse?, error: Error?) {
         #if os(iOS)
         #if !OAUTH_APP_EXTENSIONS
+        #if !targetEnvironment(macCatalyst)
         UIApplication.shared.isNetworkActivityIndicatorVisible = false
+        #endif
         #endif
         #endif
 
@@ -125,7 +133,7 @@ open class OAuthSwiftHTTPRequest: NSObject, OAuthSwiftRequestHandle {
                 oauthError = .tokenExpired(error: error)
             }
 
-            failureHandler?(oauthError)
+            completion?(.failure(oauthError))
             return
         }
 
@@ -143,7 +151,7 @@ open class OAuthSwiftHTTPRequest: NSObject, OAuthSwiftRequestHandle {
                 userInfo["Response-Headers"] = response.allHeaderFields
             }
             let error = NSError(domain: OAuthSwiftError.Domain, code: badRequestCode, userInfo: userInfo)
-            failureHandler?(.requestError(error:error, request: request))
+            completion?(.failure(.requestError(error:error, request: request)))
             return
         }
 
@@ -181,29 +189,29 @@ open class OAuthSwiftHTTPRequest: NSObject, OAuthSwiftRequestHandle {
                 userInfo[NSURLErrorFailingURLErrorKey] = urlString
             }
 
-            let error = NSError(domain: NSURLErrorDomain, code: response.statusCode, userInfo: userInfo)
+            let error = NSError(domain: OAuthSwiftError.Domain, code: response.statusCode, userInfo: userInfo)
             if error.isExpiredToken {
-                failureHandler?(.tokenExpired(error: error))
+                completion?(.failure(.tokenExpired(error: error)))
             } else if errorCode == "authorization_pending" {
-                failureHandler?(.authorizationPending(error: error, request: request))
+                completion?(.failure(.authorizationPending(error: error, request: request)))
             } else if errorCode == "slow_down" {
-                failureHandler?(.slowDown(error: error, request: request))
+                completion?(.failure(.slowDown(error: error, request: request)))
             } else if errorCode == "access_denied" {
-                failureHandler?(.accessDenied(error: error, request: request))
+                completion?(.failure(.accessDenied(error: error, request: request)))
             } else {
-                failureHandler?(.requestError(error: error, request: request))
+                completion?(.failure(.requestError(error: error, request: request)))
             }
             return
         }
 
         // MARK: success
-        successHandler?(OAuthSwiftResponse(data: responseData, response: response, request: request))
+        completion?(.success(OAuthSwiftResponse(data: responseData, response: response, request: request)))
     }
 
     open func cancel() {
         // perform lock here to prevent cancel calls on another thread while creating the request
-        objc_sync_enter(self)
-        defer { objc_sync_exit(self) }
+        requestLock.lock()
+        defer { requestLock.unlock() }
         // either cancel the request if it's already running or set the flag to prohibit creation of the request
         if let task = task {
             task.cancel()
